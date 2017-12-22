@@ -3,7 +3,7 @@ package io.buoyant.namer
 import com.twitter.finagle.Name.Bound
 import com.twitter.finagle._
 import com.twitter.finagle.naming.NameInterpreter
-import com.twitter.util.{Activity, Var}
+import com.twitter.util.{Activity, Await, Return, Throw, Try, Var}
 import io.buoyant.namer.DelegateTree._
 import scala.util.control.{NonFatal, NoStackTrace}
 import scala.{Exception => ScalaException}
@@ -80,7 +80,11 @@ case class ConfiguredNamersInterpreter(namers: Seq[(Path, Namer)])
     tree: NameTree[Name.Path]
   ): Activity[DelegateTree[Bound]] = {
     val dtree = DelegateTree.fromNameTree(tree)
-    delegateBind(dtab, 0, dtree).map(_.simplified)
+
+    Try(delegateBind(dtab, 0, dtree).simplified) match {
+      case Return(r) => Activity.value(r)
+      case Throw(e) => Activity.exception(e)
+    }
   }
 
   val MaxDepth = 100
@@ -118,54 +122,36 @@ case class ConfiguredNamersInterpreter(namers: Seq[(Path, Namer)])
     dtab: Dtab,
     depth: Int,
     tree: DelegateTree[Name]
-  ): Activity[DelegateTree[Name.Bound]] =
+  ): DelegateTree[Name.Bound] =
     if (depth > MaxDepth)
-      Activity.exception(new IllegalArgumentException("Max recursion level reached."))
+      throw new IllegalArgumentException("Max recursion level reached.")
     else tree match {
-      case tree@Exception(_, _, _) => Activity.value(tree)
-      case tree@Empty(_, _) => Activity.value(tree)
-      case tree@Fail(_, _) => Activity.value(tree)
-      case tree@Neg(_, _) => Activity.value(tree)
-
-      case Leaf(path, dentry, bound@Name.Bound(_)) =>
-        Activity.value(Leaf(path, dentry, bound))
-
+      case tree@Exception(_, _, _) => tree
+      case tree@Empty(_, _) => tree
+      case tree@Fail(_, _) => tree
+      case tree@Neg(_, _) => tree
+      case Leaf(path, dentry, bound@Name.Bound(_)) => Leaf(path, dentry, bound)
       case Leaf(_, dentry, Name.Path(path)) =>
         // Resolve this leaf path through the dtab and bind the resulting tree.
-        delegateLookup(dtab, dentry, path).flatMap { delegateTree =>
+        Await.result(delegateLookup(dtab, dentry, path).toFuture.map { delegateTree =>
           delegateBind(dtab, depth + 1, delegateTree)
-        }
-
-      case Delegate(path, dentry, tree) =>
-        delegateBind(dtab, depth, tree).map(Delegate(path, dentry, _))
-
-      case Alt(path, dentry) => Activity.value(Neg(path, dentry))
-      case Alt(path, dentry, tree) => delegateBind(dtab, depth, tree).map(Delegate(path, dentry, _))
+        })
+      case Delegate(path, dentry, tree) => Delegate(path, dentry, delegateBind(dtab, depth, tree))
+      case Alt(path, dentry) => Neg(path, dentry)
+      case Alt(path, dentry, tree) => Delegate(path, dentry, delegateBind(dtab, depth, tree))
       case Alt(path, dentry, trees@_*) =>
         // Unlike Namer.bind, we bind *all* alternate trees.
-        val acts = trees.map { tree =>
-          delegateBind(dtab, depth, tree).transform {
-            case Activity.Failed(e) => Activity.value(Exception(path, dentry, e))
-            case state => Activity(Var(state))
-          }
+        val alts = trees.map { tree =>
+          delegateBind(dtab, depth, tree)
         }
-        Activity.collect(acts).map { alts =>
-          Alt(path, dentry, alts: _*)
-        }
-      case Union(path, dentry) => Activity.value(Neg(path, dentry))
-      case Union(path, dentry, Weighted(_, tree)) =>
-        delegateBind(dtab, depth, tree).map(Delegate(path, dentry, _))
+        Alt(path, dentry, alts: _*)
+      case Union(path, dentry) => Neg(path, dentry)
+      case Union(path, dentry, Weighted(_, tree)) => Delegate(path, dentry, delegateBind(dtab, depth, tree))
       case Union(path, dentry, trees@_*) =>
-        val acts = trees.map {
-          case Weighted(w, tree) =>
-            delegateBind(dtab, depth, tree).transform {
-              case Activity.Failed(e) => Activity.value(Exception(path, dentry, e))
-              case state => Activity(Var(state))
-            }.map(Weighted(w, _))
+        val branches = trees.map {
+          case Weighted(w, tree) => Weighted(w, delegateBind(dtab, depth, tree))
         }
-        Activity.collect(acts).map { branches =>
-          Union(path, dentry, branches: _*)
-        }
+        Union(path, dentry, branches: _*)
     }
 
   override def dtab: Activity[Dtab] = Activity.value(Dtab.empty)

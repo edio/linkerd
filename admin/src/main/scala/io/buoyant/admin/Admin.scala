@@ -82,7 +82,6 @@ object Admin {
   )
 
   def baseHandlers: Seq[Handler] = Seq(
-    Handler("/admin/balancers.json", new LoadBalancersHandler()),
     Handler("/admin/contention", new TextBlockView andThen new ContentionHandler),
     Handler("/admin/lint", new AdminAssetsFilter andThen new LintHandler),
     Handler("/admin/lint.json", new LintHandler),
